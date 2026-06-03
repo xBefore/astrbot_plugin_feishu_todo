@@ -1,0 +1,13 @@
+{
+  "feishu_app_id": {
+    "description": "飞书应用 App ID",
+    "type": "string",
+    "hint": "在飞书开放平台创建应用后获取"
+  },
+  "feishu_app_secret": {
+    "description": "飞书应用 App Secret",
+    "type": "string",
+    "hint": "在飞书开放平台创建应用后获取",
+    "obvious_hint": true
+  }
+}

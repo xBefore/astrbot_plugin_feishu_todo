@@ -1,14 +1,85 @@
-# astrbot-plugin-helloworld
+# 飞书待办提醒插件
 
-AstrBot 插件模板 / A template plugin for AstrBot plugin feature
+自动识别飞书私聊消息中的任务信息并创建飞书待办，支持多级 DDL 提醒。
 
-> [!NOTE]
-> This repo is just a template of [AstrBot](https://github.com/AstrBotDevs/AstrBot) Plugin.
-> 
-> [AstrBot](https://github.com/AstrBotDevs/AstrBot) is an agentic assistant for both personal and group conversations. It can be deployed across dozens of mainstream instant messaging platforms, including QQ, Telegram, Feishu, DingTalk, Slack, LINE, Discord, Matrix, etc. In addition, it provides a reliable and extensible conversational AI infrastructure for individuals, developers, and teams. Whether you need a personal AI companion, an intelligent customer support agent, an automation assistant, or an enterprise knowledge base, AstrBot enables you to quickly build AI applications directly within your existing messaging workflows.
+## 功能介绍
 
-# Supports
+当用户在飞书私聊中向机器人发送任务描述（文本或截图）时，LLM 会自动提取任务信息（标题、描述、截止时间、复杂度等），调用飞书 Task v2 API 创建待办任务，并在飞书客户端原生「任务」面板中统一管理。同时，插件内置定时巡检机制，会在截止时间到达前通过飞书 IM 主动推送提醒消息。
 
-- [AstrBot Repo](https://github.com/AstrBotDevs/AstrBot)
-- [AstrBot Plugin Development Docs (Chinese)](https://docs.astrbot.app/dev/star/plugin-new.html)
-- [AstrBot Plugin Development Docs (English)](https://docs.astrbot.app/en/dev/star/plugin-new.html)
+## 前置条件
+
+- AstrBot 版本 >= 4.16
+- 飞书应用已创建并添加以下 scope：
+  - `task:task:write` — 创建任务、设置提醒
+  - `task:task:read` — 查询任务列表
+- 飞书应用已开启机器人能力，并与用户处于同一租户下
+
+## 安装方法
+
+### 方式一：AstrBot WebUI 插件市场安装
+
+在 AstrBot WebUI 的插件市场中搜索「飞书待办提醒」并安装。
+
+### 方式二：手动安装
+
+```bash
+cd AstrBot/data/plugins
+git clone https://github.com/xBefore/astrbot_plugin_feishu_todo.git
+```
+
+重启 AstrBot 即可加载插件。
+
+## 配置说明
+
+在 AstrBot WebUI 的插件配置中填写以下信息：
+
+| 配置项 | 说明 |
+|--------|------|
+| `feishu_app_id` | 飞书应用 App ID，在飞书开放平台创建应用后获取 |
+| `feishu_app_secret` | 飞书应用 App Secret，在飞书开放平台创建应用后获取 |
+
+## 使用方法
+
+1. 确保飞书应用已配置完成并启用了机器人能力
+2. 在飞书中找到机器人，发送私聊消息描述你的任务，例如：
+   - "下周五下午三点前完成项目报告，这个比较复杂，提前3天提醒我"
+   - "明天下午六点去取快递"
+   - 发送截图，LLM 可自动识别截图中的任务信息
+3. 机器人会自动创建飞书待办并通过回复告知创建结果
+4. 所有任务可在飞书客户端原生「任务」面板中查看管理
+
+## 提醒策略
+
+| 任务类型 | 提醒规则 | 说明 |
+|---------|----------|------|
+| 复杂任务 | 截止前 2 天 + 截止前 2 小时 | 多人协作或需要多步骤的任务 |
+| 普通任务 | 截止前 1 天 + 截止前 2 小时 | 常规任务 |
+| 自定义 | 在以上基础上 + 截止前 N 天 | 用户口头指定，如"提前3天提醒我" |
+
+所有提醒每条只触发一次，不会重复推送。
+
+## 常见问题
+
+### 插件未加载
+
+- 检查 `feishu_app_id` 和 `feishu_app_secret` 是否已填写
+- 查看 AstrBot 日志是否有报错信息
+
+### Function Tool 未注册
+
+- 确保 AstrBot 版本 >= 4.16
+- 确保当前对话的平台为飞书（lark），本插件仅支持飞书平台
+
+### 提醒未推送
+
+- 检查飞书应用是否具有消息发送权限
+- 确认机器人与用户之间存在有效的会话（用户需要先主动发送过消息）
+
+### 创建任务失败
+
+- 确认飞书应用已添加 `task:task:write` scope
+- 确认 App ID 和 App Secret 正确无误
+
+## 开源协议
+
+本项目基于 [AGPL-3.0](LICENSE) 协议开源。
