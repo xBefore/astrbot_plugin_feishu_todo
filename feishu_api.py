@@ -1,56 +1,70 @@
-"""飞书任务 API HTTP 客户端"""
-
 import time
-import logging
+from typing import Any
+
 import httpx
 
-logger = logging.getLogger(__name__)
-
-FEISHU_BASE_URL = "https://open.feishu.cn/open-apis"
+from astrbot.api import logger
 
 
 class FeishuTaskClient:
+    """飞书 Task v2 API 异步客户端"""
+
+    BASE_URL = "https://open.feishu.cn/open-apis"
+
     def __init__(self, app_id: str, app_secret: str):
         self._app_id = app_id
         self._app_secret = app_secret
-        self._token = ""
-        self._token_expires = 0
+        self._tenant_access_token: str = ""
+        self._token_expires_at: float = 0.0
+        self._client = httpx.AsyncClient(timeout=15.0)
 
-    async def _get_token(self) -> str:
-        if self._token and time.time() < self._token_expires - 120:
-            return self._token
+    async def _ensure_token(self) -> None:
+        """获取或刷新 tenant_access_token，提前 120 秒刷新"""
+        now = time.time()
+        if self._tenant_access_token and now < self._token_expires_at - 120:
+            return
 
-        async with httpx.AsyncClient() as client:
-            resp = await client.post(
-                f"{FEISHU_BASE_URL}/auth/v3/tenant_access_token/internal",
-                json={"app_id": self._app_id, "app_secret": self._app_secret},
-                timeout=10,
+        url = f"{self.BASE_URL}/auth/v3/tenant_access_token/internal"
+        resp = await self._client.post(
+            url,
+            json={
+                "app_id": self._app_id,
+                "app_secret": self._app_secret,
+            },
+        )
+        data = resp.json()
+        if data.get("code") != 0:
+            raise RuntimeError(
+                f"获取 tenant_access_token 失败: code={data.get('code')}, msg={data.get('msg')}"
             )
-            data = resp.json()
-            if data.get("code") != 0:
-                raise RuntimeError(f"获取 tenant_access_token 失败: {data}")
+        self._tenant_access_token = data["tenant_access_token"]
+        self._token_expires_at = now + data.get("expire", 7200)
 
-            self._token = data["tenant_access_token"]
-            self._token_expires = time.time() + data.get("expire", 7200)
-            logger.info("已刷新飞书 tenant_access_token")
-            return self._token
-
-    async def _request(self, method: str, path: str, **kwargs) -> dict:
-        token = await self._get_token()
-        headers = kwargs.pop("headers", {})
-        headers["Authorization"] = f"Bearer {token}"
-        headers.setdefault("Content-Type", "application/json")
-
-        async with httpx.AsyncClient() as client:
-            resp = await client.request(
-                method, f"{FEISHU_BASE_URL}{path}",
-                headers=headers, timeout=kwargs.pop("timeout", 15), **kwargs,
+    async def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        json_data: dict[str, Any] | None = None,
+        params: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """发送请求并校验返回码"""
+        await self._ensure_token()
+        url = f"{self.BASE_URL}{path}"
+        headers = {
+            "Authorization": f"Bearer {self._tenant_access_token}",
+            "Content-Type": "application/json; charset=utf-8",
+        }
+        resp = await self._client.request(
+            method, url, headers=headers, json=json_data, params=params
+        )
+        data = resp.json()
+        code = data.get("code", -1)
+        if code != 0:
+            raise RuntimeError(
+                f"飞书 API 错误: code={code}, msg={data.get('msg')}, path={path}"
             )
-            data = resp.json()
-            code = data.get("code", -1)
-            if code != 0:
-                raise RuntimeError(f"飞书 API 错误 [{code}]: {data.get('msg', data)}")
-            return data
+        return data
 
     async def create_task(
         self,
@@ -58,40 +72,69 @@ class FeishuTaskClient:
         due_timestamp_ms: int,
         assignee_open_id: str,
         description: str = "",
-        reminder_minutes: int = 120,
-    ) -> dict:
-        payload = {
-            "summary": summary,
-            "description": description,
-            "due": {"timestamp": str(due_timestamp_ms), "is_all_day": False},
-            "members": [
-                {"id": assignee_open_id, "type": "user", "role": "assignee"}
-            ],
-            "reminders": [
-                {"relative_fire_minute": reminder_minutes}
-            ],
-        }
+        reminder_minutes: list[int] | None = None,
+    ) -> dict[str, Any]:
+        """
+        创建飞书待办任务
 
-        data = await self._request("POST", "/task/v2/tasks", json=payload)
-        task = data["data"]["task"]
-        logger.info(f"飞书任务已创建: {task['guid']} - {summary}")
+        Args:
+            summary: 任务标题
+            due_timestamp_ms: 截止时间（UTC 毫秒时间戳）
+            assignee_open_id: 负责人的 open_id
+            description: 任务备注
+            reminder_minutes: 相对截止时间的提醒分钟数列表（如 [120] 表示截止前2小时提醒）
+
+        Returns:
+            飞书 API 返回的 task 字典
+        """
+        members = [
+            {
+                "type": "user",
+                "id": assignee_open_id,
+                "role": "assignee",
+            }
+        ]
+
+        due = {"timestamp": str(due_timestamp_ms), "is_all_day": False}
+
+        reminders = []
+        if reminder_minutes:
+            for i, minutes in enumerate(reminder_minutes):
+                reminders.append({"id": str(i), "relative_fire_minute": minutes})
+
+        body: dict[str, Any] = {
+            "summary": summary,
+            "due": due,
+            "members": members,
+        }
+        if description:
+            body["description"] = description
+        if reminders:
+            body["reminders"] = reminders
+
+        data = await self._request(
+            "POST", "/task/v2/tasks?user_id_type=open_id", json_data=body
+        )
+        task = data.get("data", {}).get("task", {})
+        logger.info(f"创建飞书任务成功: guid={task.get('guid')}, summary={summary}")
         return task
 
-    async def list_tasks(self, page_size: int = 100) -> list:
-        all_tasks = []
-        page_token = ""
+    async def list_tasks(
+        self, page_size: int = 50, user_id_type: str = "open_id"
+    ) -> list[dict[str, Any]]:
+        """获取当前应用的任务列表"""
+        data = await self._request(
+            "GET",
+            "/task/v2/tasks",
+            params={
+                "page_size": page_size,
+                "user_id_type": user_id_type,
+            },
+        )
+        items = data.get("data", {}).get("items", [])
+        logger.info(f"获取飞书任务列表: {len(items)} 条")
+        return items
 
-        while True:
-            params = {"page_size": page_size}
-            if page_token:
-                params["page_token"] = page_token
-
-            data = await self._request("GET", "/task/v2/tasks", params=params)
-            items = data.get("data", {}).get("items", [])
-            all_tasks.extend(items)
-
-            page_token = data.get("data", {}).get("page_token", "")
-            if not page_token:
-                break
-
-        return all_tasks
+    async def close(self) -> None:
+        """关闭 HTTP 客户端"""
+        await self._client.aclose()
