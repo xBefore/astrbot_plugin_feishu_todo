@@ -1,159 +1,40 @@
-import asyncio
-import uuid
-from datetime import datetime, timezone
-from zoneinfo import ZoneInfo
+"""飞书待办提醒插件 — AstrBot 插件
 
+用户向小织发送任务详情（文本/截图），插件自动：
+1. 调用飞书 Task API 创建待办，设置截止时间 + 原生 2h 提醒
+2. 按复杂/普通任务分级设置额外提醒（2天前/1天前）
+3. 支持用户口头指定自定义提醒时间
+4. 每30分钟巡检一次，推送到期提醒到飞书私聊
+"""
+
+import asyncio
+import json
+from datetime import datetime, timezone
+from pathlib import Path
+
+from astrbot.api.star import Star, Context
+from astrbot.api.event import AstrMessageEvent, MessageChain, filter
+from astrbot.core.agent.tool import FunctionTool, ToolExecResult
+from astrbot.core.agent.run_context import ContextWrapper
+from astrbot.core.astr_agent_context import AstrAgentContext
+from astrbot.core.utils.astrbot_path import get_astrbot_data_path
+from astrbot.api import logger
 from pydantic import Field
 from pydantic.dataclasses import dataclass
 
-from astrbot.api import logger
-from astrbot.api.event import AstrMessageEvent
-from astrbot.api.star import Context, Star, register
-from astrbot.core.agent.run_context import ContextWrapper
-from astrbot.core.agent.tool import FunctionTool, ToolExecResult
-from astrbot.core.astr_agent_context import AstrAgentContext
-from astrbot.api.event import MessageChain
-
 from feishu_api import FeishuTaskClient
 
-_task_ids_key = "_task_ids"
-
-
-@register(
-    "astrbot_plugin_feishu_todo",
-    "xBefore",
-    "自动识别飞书消息中的任务并创建飞书待办，支持多级 DDL 提醒",
-    "0.1.0",
-)
-class FeishuTodoPlugin(Star):
-    def __init__(self, context: Context):
-        super().__init__(context)
-        self._client: FeishuTaskClient | None = None
-        self._poll_task: asyncio.Task | None = None
-
-    async def initialize(self):
-        """插件异步初始化：加载配置、实例化客户端、注册 Function Tool、启动定时巡检"""
-        config = self.context.get_config()
-        app_id = config.get("feishu_app_id", "")
-        app_secret = config.get("feishu_app_secret", "")
-
-        if not app_id or not app_secret:
-            logger.warning(
-                "飞书待办插件: 未配置 feishu_app_id 或 feishu_app_secret，请在 WebUI 插件配置中填写"
-            )
-            return
-
-        self._client = FeishuTaskClient(app_id, app_secret)
-        self.context.add_llm_tools(CreateReminderTaskTool(self))
-        logger.info("飞书待办插件: Function Tool 已注册")
-
-        self._poll_task = asyncio.create_task(self._poll_loop())
-        logger.info("飞书待办插件: 定时巡检已启动（间隔 30 分钟）")
-
-    async def terminate(self):
-        """插件销毁：取消定时任务，释放资源"""
-        if self._poll_task and not self._poll_task.done():
-            self._poll_task.cancel()
-            try:
-                await self._poll_task
-            except asyncio.CancelledError:
-                pass
-        if self._client:
-            await self._client.close()
-        logger.info("飞书待办插件: 已停止")
-
-    async def _poll_loop(self):
-        """每 30 分钟扫描一次，匹配提醒规则后推送"""
-        while True:
-            await asyncio.sleep(30 * 60)
-            try:
-                await self._check_and_notify()
-            except Exception as e:
-                logger.error(f"飞书待办插件巡检异常: {e}")
-
-    async def _check_and_notify(self):
-        """扫描所有任务，检查是否需要提醒"""
-        task_ids: list[str] = await self.get_kv_data(_task_ids_key, [])
-        if not task_ids:
-            return
-
-        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-        remaining_ids: list[str] = []
-
-        for guid in task_ids:
-            try:
-                task_data: dict = await self.get_kv_data(f"task_{guid}", {})
-                if not task_data:
-                    logger.warning(f"飞书待办插件: task_{guid} 数据已损坏，移除追踪")
-                    continue
-
-                umo = task_data.get("umo", "")
-                deadline_ms = task_data.get("deadline_ms", 0)
-                rules: list[dict] = task_data.get("rules", [])
-
-                if deadline_ms == 0:
-                    remaining_ids.append(guid)
-                    continue
-
-                all_triggered = True
-                for rule in rules:
-                    if rule.get("triggered", False):
-                        continue
-                    minutes_before = rule.get("minutes_before", 0)
-                    notify_ms = deadline_ms - minutes_before * 60 * 1000
-                    if now_ms >= notify_ms:
-                        try:
-                            remaining_min = minutes_before
-                            if remaining_min >= 60 * 24:
-                                time_desc = f"{remaining_min // (60 * 24)} 天"
-                            elif remaining_min >= 60:
-                                time_desc = f"{remaining_min // 60} 小时"
-                            else:
-                                time_desc = f"{remaining_min} 分钟"
-                            msg = (
-                                f"⏰ 任务提醒\n"
-                                f"📋 {task_data.get('summary', '未知任务')}\n"
-                                f"⏳ 距截止还有 {time_desc}\n"
-                                f"{'🔴 这是复杂任务' if task_data.get('is_complex') else ''}"
-                            )
-                            chain = MessageChain().message(msg)
-                            await self.context.send_message(umo, chain)
-                            rule["triggered"] = True
-                            logger.info(
-                                f"飞书待办插件: 已推送提醒 task={guid}, minutes_before={minutes_before}"
-                            )
-                        except Exception as e:
-                            logger.error(f"飞书待办插件推送提醒失败: {e}")
-
-                    if not rule.get("triggered", False):
-                        all_triggered = False
-
-                await self.put_kv_data(f"task_{guid}", task_data)
-
-                if not all_triggered:
-                    remaining_ids.append(guid)
-                else:
-                    logger.info(f"飞书待办插件: 任务 {guid} 所有提醒已完成，移除追踪")
-
-            except Exception as e:
-                logger.error(f"飞书待办插件处理任务 {guid} 异常: {e}")
-                remaining_ids.append(guid)
-
-        await self.put_kv_data(_task_ids_key, remaining_ids)
+_star = None
 
 
 @dataclass
 class CreateReminderTaskTool(FunctionTool[AstrAgentContext]):
-    """创建飞书待办任务的 Function Tool"""
-
-    plugin: FeishuTodoPlugin = Field(default=None, exclude=True)
-
     name: str = "create_reminder_task"
     description: str = (
-        "创建飞书待办提醒任务。当用户在飞书私聊中提到待办事项、任务、截止日期、DDL、deadline、"
-        "需要完成某事等信息时，调用此工具自动提取任务信息并创建飞书待办。"
-        "工具会根据任务复杂度自动设置多级提醒：复杂任务在截止前2天和2小时提醒，"
-        "普通任务在截止前1天和2小时提醒。用户也可口头指定额外提醒时间。"
+        "当用户在对话中提及待办事项、任务、作业、截止日期(DDL)或学习任务时调用。"
+        "从用户消息（文本或截图描述）中提取：任务名称、详细描述、截止时间、是否复杂任务、自定义提醒天数。"
+        "复杂任务判断标准：大作业/论文/项目/需要长期准备 = true，日常作业/小事 = false。"
+        "即使用户只发了截图，也请先描述截图内容，再提取任务信息调用此工具。"
     )
     parameters: dict = Field(
         default_factory=lambda: {
@@ -161,124 +42,254 @@ class CreateReminderTaskTool(FunctionTool[AstrAgentContext]):
             "properties": {
                 "summary": {
                     "type": "string",
-                    "description": "任务标题，简洁概括任务内容，不超过100字",
+                    "description": "任务名称或标题，简洁概括",
                 },
                 "description": {
                     "type": "string",
-                    "description": "任务详细描述，包含任务的关键细节和要求",
+                    "description": "任务详细描述，用户提供的额外说明。如无则填空字符串",
                 },
                 "deadline": {
                     "type": "string",
-                    "description": (
-                        "任务截止时间，格式为 ISO 8601，如 '2025-06-15T18:00+08:00'。"
-                        "必须基于用户输入的时间推断，时区默认为 Asia/Shanghai (UTC+8)。"
-                        "如果用户只说了日期没说时间，默认为当天 23:59。"
-                    ),
+                    "description": "截止时间。格式 YYYY-MM-DD 或 YYYY-MM-DD HH:MM。仅日期时自动补 23:59",
                 },
                 "is_complex": {
                     "type": "boolean",
-                    "description": (
-                        "是否为复杂任务。判断标准：涉及多人协作、需要多步骤完成、"
-                        "或有较高出错风险的任务为复杂任务。简单查资料、写短文等不算复杂。"
-                    ),
+                    "description": "是否为复杂任务。大作业/论文/项目/需长期准备 = true",
                 },
                 "custom_remind_days": {
-                    "type": "number",
-                    "description": (
-                        "用户口头指定的额外提醒天数，在截止前 N 天额外提醒。"
-                        "例如用户说'提前3天提醒我'，则填 3。没有则不填。"
-                    ),
+                    "type": "array",
+                    "items": {"type": "integer"},
+                    "description": "用户口头指定的自定义提前提醒天数，如用户说'提前3天提醒'则填[3]。无则填空数组[]",
                 },
             },
             "required": ["summary", "deadline", "is_complex"],
-        },
+        }
     )
 
     async def call(
         self, context: ContextWrapper[AstrAgentContext], **kwargs
     ) -> ToolExecResult:
-        summary = kwargs.get("summary", "")
-        description = kwargs.get("description", "")
-        deadline_str = kwargs.get("deadline", "")
-        is_complex = kwargs.get("is_complex", False)
-        custom_remind_days = kwargs.get("custom_remind_days")
+        global _star
+        if _star is None:
+            return "插件尚未初始化，请稍后再试"
+        return await _star._handle_create_task(context, **kwargs)
 
-        if not summary or not deadline_str:
-            return ToolExecResult(output="缺少必要参数：任务标题或截止时间", errno=1)
 
-        if not self.plugin._client:
-            return ToolExecResult(output="飞书待办插件未初始化，请检查配置", errno=1)
+class Main(Star):
+    def __init__(self, context: Context):
+        super().__init__(context)
+        global _star
+        _star = self
+        self._feishu: FeishuTaskClient | None = None
+        self._scan_task: asyncio.Task | None = None
+        self._config: dict = {}
 
-        try:
-            dt = datetime.fromisoformat(deadline_str)
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=ZoneInfo("Asia/Shanghai"))
-            deadline_ms = int(dt.timestamp() * 1000)
-        except (ValueError, TypeError):
-            return ToolExecResult(output=f"截止时间格式错误: {deadline_str}", errno=1)
+    async def initialize(self):
+        self._config = await self._load_config()
+        app_id = self._config.get("feishu_app_id", "")
+        app_secret = self._config.get("feishu_app_secret", "")
 
-        event: AstrMessageEvent = context.context.event
-        umo = event.unified_msg_origin
-        sender_id = event.get_sender_id()
-
-        rules: list[dict] = []
-
-        if is_complex:
-            rules.append({"minutes_before": 60 * 24 * 2, "triggered": False})
-        else:
-            rules.append({"minutes_before": 60 * 24, "triggered": False})
-
-        rules.append({"minutes_before": 120, "triggered": False})
-
-        if custom_remind_days and custom_remind_days > 0:
-            rules.append(
-                {
-                    "minutes_before": int(custom_remind_days * 24 * 60),
-                    "triggered": False,
-                }
+        if not app_id or not app_secret:
+            logger.warning(
+                "飞书应用凭证未配置！请在服务器上编辑 "
+                "data/plugin_data/astrbot_plugin_task_reminder/config.json "
+                "填入 feishu_app_id 和 feishu_app_secret，然后重载插件"
             )
+            return
 
-        try:
-            task = await self.plugin._client.create_task(
-                summary=summary,
-                due_timestamp_ms=deadline_ms,
-                assignee_open_id=sender_id,
-                description=description,
-                reminder_minutes=[120],
-            )
-        except Exception as e:
-            logger.error(f"创建飞书任务失败: {e}")
-            return ToolExecResult(output=f"创建飞书任务失败: {e}", errno=1)
+        self._feishu = FeishuTaskClient(app_id, app_secret)
+        self.context.add_llm_tools(CreateReminderTaskTool())
+        logger.info("[待办提醒] 已注册 create_reminder_task 工具")
 
-        guid = task.get("guid", str(uuid.uuid4()))
+        self._scan_task = asyncio.create_task(self._scan_loop())
+        logger.info("[待办提醒] 巡检已启动（每30分钟）")
 
-        task_data = {
-            "guid": guid,
-            "summary": summary,
-            "deadline_ms": deadline_ms,
-            "is_complex": is_complex,
-            "rules": rules,
-            "umo": umo,
-        }
-        await self.plugin.put_kv_data(f"task_{guid}", task_data)
+    async def terminate(self):
+        if self._scan_task:
+            self._scan_task.cancel()
 
-        task_ids: list[str] = await self.plugin.get_kv_data(_task_ids_key, [])
-        task_ids.append(guid)
-        await self.plugin.put_kv_data(_task_ids_key, task_ids)
+    # ── 配置 ──────────────────────────────────────────────
 
-        task_type = "复杂任务" if is_complex else "普通任务"
-        remind_desc_parts = ["截止前 2 小时"]
-        if is_complex:
-            remind_desc_parts.insert(0, "截止前 2 天")
-        else:
-            remind_desc_parts.insert(0, "截止前 1 天")
-        if custom_remind_days and custom_remind_days > 0:
-            remind_desc_parts.insert(0, f"提前 {custom_remind_days} 天")
-        output = (
-            f"✅ 飞书待办已创建！\n"
-            f"📋 任务：{summary}\n"
-            f"⏰ 截止：{deadline_str}\n"
-            f"📌 类型：{task_type}\n"
-            f"🔔 提醒节点：{'、'.join(remind_desc_parts)}"
+    async def _load_config(self) -> dict:
+        config_dir = (
+            Path(get_astrbot_data_path())
+            / "plugin_data"
+            / "astrbot_plugin_task_reminder"
         )
-        return ToolExecResult(output=output, errno=0)
+        config_dir.mkdir(parents=True, exist_ok=True)
+        config_file = config_dir / "config.json"
+
+        if not config_file.exists():
+            default = {"feishu_app_id": "", "feishu_app_secret": ""}
+            config_file.write_text(
+                json.dumps(default, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            return default
+
+        return json.loads(config_file.read_text(encoding="utf-8"))
+
+    # ── 创建任务（Function Tool 回调）─────────────────────
+
+    async def _handle_create_task(
+        self, context: ContextWrapper[AstrAgentContext], **kwargs
+    ) -> str:
+        try:
+            event: AstrMessageEvent = context.context.event
+            user_id = event.get_sender_id()
+            umo = event.unified_msg_origin
+
+            summary = kwargs.get("summary", "")
+            description = kwargs.get("description", "")
+            deadline_str = kwargs.get("deadline", "")
+            is_complex = kwargs.get("is_complex", False)
+            custom_remind_days = kwargs.get("custom_remind_days", [])
+
+            due_dt = _parse_deadline(deadline_str)
+            due_ms = int(due_dt.timestamp() * 1000)
+
+            task = await self._feishu.create_task(
+                summary=summary,
+                description=description,
+                due_timestamp_ms=due_ms,
+                assignee_open_id=user_id,
+                reminder_minutes=120,
+            )
+
+            task_guid = task["guid"]
+            task_url = task.get("url", "")
+
+            rules: list[dict] = [
+                {"minutes_before": 120, "triggered": False}
+            ]
+            if is_complex:
+                rules.append({"minutes_before": 2880, "triggered": False})
+            else:
+                rules.append({"minutes_before": 1440, "triggered": False})
+            for days in custom_remind_days:
+                rules.append(
+                    {"minutes_before": days * 24 * 60, "triggered": False}
+                )
+
+            task_data = {
+                "summary": summary,
+                "deadline_ms": due_ms,
+                "deadline_str": deadline_str,
+                "is_complex": is_complex,
+                "rules": rules,
+                "umo": umo,
+            }
+            await self.put_kv_data(f"task_{task_guid}", task_data)
+
+            task_ids = await self.get_kv_data("_task_ids", [])
+            task_ids.append(task_guid)
+            await self.put_kv_data("_task_ids", task_ids)
+
+            complex_str = "复杂" if is_complex else "普通"
+            remind_parts = []
+            if is_complex:
+                remind_parts.append("截止前2天")
+            else:
+                remind_parts.append("截止前1天")
+            remind_parts.append("截止前2小时")
+            for d in custom_remind_days:
+                remind_parts.append(f"提前{d}天")
+
+            result = (
+                f"✅ 已创建待办任务「{summary}」\n"
+                f"⏰ 截止：{deadline_str}\n"
+                f"📂 类型：{complex_str}\n"
+                f"🔔 提醒：{'、'.join(remind_parts)}\n"
+            )
+            if task_url:
+                result += f"🔗 查看：{task_url}"
+            return result
+
+        except Exception as e:
+            logger.error(f"创建任务失败: {e}")
+            return f"创建任务失败: {e}"
+
+    # ── 定时巡检 ──────────────────────────────────────────
+
+    async def _scan_loop(self):
+        await asyncio.sleep(60)
+        while True:
+            try:
+                await self._scan_and_remind()
+            except Exception as e:
+                logger.error(f"[待办提醒] 巡检异常: {e}")
+            await asyncio.sleep(1800)
+
+    async def _scan_and_remind(self):
+        if self._feishu is None:
+            return
+
+        logger.info("[待办提醒] 开始巡检...")
+        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        task_ids: list = await self.get_kv_data("_task_ids", [])
+
+        for task_guid in task_ids:
+            try:
+                task_data = await self.get_kv_data(f"task_{task_guid}")
+                if not task_data:
+                    continue
+
+                deadline_ms = task_data["deadline_ms"]
+                if now_ms >= deadline_ms:
+                    continue
+
+                time_left_minutes = (deadline_ms - now_ms) / (1000 * 60)
+                rules = task_data["rules"]
+                updated = False
+
+                for rule in rules:
+                    if rule["triggered"]:
+                        continue
+                    if time_left_minutes <= rule["minutes_before"]:
+                        await self._send_reminder(
+                            umo=task_data["umo"],
+                            summary=task_data["summary"],
+                            minutes_before=rule["minutes_before"],
+                        )
+                        rule["triggered"] = True
+                        updated = True
+
+                if updated:
+                    task_data["rules"] = rules
+                    await self.put_kv_data(f"task_{task_guid}", task_data)
+
+            except Exception as e:
+                logger.error(f"[待办提醒] 处理 {task_guid} 失败: {e}")
+
+        logger.info("[待办提醒] 巡检完成")
+
+    async def _send_reminder(
+        self, umo: str, summary: str, minutes_before: int
+    ):
+        hours = minutes_before / 60
+        if hours >= 24:
+            time_desc = f"{int(hours / 24)} 天"
+        else:
+            time_desc = f"{int(hours)} 小时"
+
+        msg = f"⏰ 提醒：任务「{summary}」还有 {time_desc} 截止，请及时处理!"
+
+        chain = MessageChain().message(msg)
+        try:
+            await self.context.send_message(umo, chain)
+            logger.info(f"[待办提醒] 已推送: {summary} ({time_desc})")
+        except Exception as e:
+            logger.error(f"[待办提醒] 推送失败: {e}")
+
+
+# ── 工具函数 ──────────────────────────────────────────────
+
+def _parse_deadline(deadline_str: str) -> datetime:
+    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            dt = datetime.strptime(deadline_str, fmt)
+            if fmt == "%Y-%m-%d":
+                dt = dt.replace(hour=23, minute=59, second=59)
+            return dt
+        except ValueError:
+            continue
+    raise ValueError(f"无法解析截止时间: {deadline_str}")
