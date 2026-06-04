@@ -135,6 +135,11 @@ class FeishuTaskClient:
         logger.info(f"获取飞书任务列表: {len(items)} 条")
         return items
 
+    async def delete_task(self, task_guid: str) -> None:
+        """删除飞书待办任务"""
+        await self._request("DELETE", f"/task/v2/tasks/{task_guid}")
+        logger.info(f"删除飞书任务成功: guid={task_guid}")
+
     async def close(self) -> None:
         """关闭 HTTP 客户端"""
         await self._client.aclose()

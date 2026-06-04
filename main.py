@@ -49,7 +49,10 @@ class FeishuTodoPlugin(Star):
             return
 
         self._client = FeishuTaskClient(app_id, app_secret)
-        self.context.add_llm_tools(CreateReminderTaskTool(plugin=self))
+        self.context.add_llm_tools(
+            CreateReminderTaskTool(plugin=self),
+            DeleteReminderTaskTool(plugin=self),
+        )
         logger.info("飞书待办插件: Function Tool 已注册")
 
         self._poll_task = asyncio.create_task(self._poll_loop())
@@ -301,3 +304,84 @@ class CreateReminderTaskTool(FunctionTool[AstrAgentContext]):
             f"🔔 提醒节点：{'、'.join(remind_desc_parts)}"
         )
         return output
+
+
+@dataclass
+class DeleteReminderTaskTool(FunctionTool[AstrAgentContext]):
+    """删除飞书待办任务的 Function Tool"""
+
+    plugin: Any = Field(default=None, exclude=True)
+
+    name: str = "delete_reminder_task"
+    description: str = (
+        "删除飞书待办任务。当用户提到删除、取消、移除某个之前创建的待办或任务时，调用此工具。"
+        "工具会搜索所有已记录的任务，按标题关键词匹配，找到后从飞书和本地同时删除。"
+    )
+    parameters: dict = Field(
+        default_factory=lambda: {
+            "type": "object",
+            "properties": {
+                "task_summary": {
+                    "type": "string",
+                    "description": (
+                        "要删除的任务标题或关键词，用于匹配已创建的任务。"
+                        "直接使用用户在对话中提到的任务名称，如 '项目报告'、'取快递'。"
+                    ),
+                },
+            },
+            "required": ["task_summary"],
+        },
+    )
+
+    async def call(
+        self, context: ContextWrapper[AstrAgentContext], **kwargs
+    ) -> ToolExecResult:
+        task_summary = kwargs.get("task_summary", "").strip()
+
+        if not task_summary:
+            return "缺少必要参数：请指定要删除的任务名称"
+
+        if not self.plugin._client:
+            return "飞书待办插件未初始化，请检查配置"
+
+        task_ids: list[str] = await self.plugin.get_kv_data(_task_ids_key, [])
+        if not task_ids:
+            return "当前没有待办任务可删除"
+
+        matched: list[dict] = []
+        for guid in task_ids:
+            task_data: dict = await self.plugin.get_kv_data(f"task_{guid}", {})
+            if not task_data:
+                continue
+            summary = task_data.get("summary", "")
+            if task_summary in summary:
+                matched.append(
+                    {"guid": guid, "summary": summary, "task_data": task_data}
+                )
+
+        if not matched:
+            all_summaries = []
+            for guid in task_ids:
+                td: dict = await self.plugin.get_kv_data(f"task_{guid}", {})
+                if td:
+                    all_summaries.append(td.get("summary", "未知"))
+            return f"未找到匹配 '{task_summary}' 的任务。当前任务列表: {', '.join(all_summaries)}"
+
+        if len(matched) > 1:
+            names = [m["summary"] for m in matched]
+            return f"找到多个匹配任务，请指定更精确的名称：{', '.join(names)}"
+
+        item = matched[0]
+        guid = item["guid"]
+
+        try:
+            await self.plugin._client.delete_task(guid)
+        except Exception as e:
+            logger.error(f"飞书 API 删除任务失败: {e}")
+            return f"删除飞书任务失败: {e}"
+
+        new_ids = [g for g in task_ids if g != guid]
+        await self.plugin.put_kv_data(_task_ids_key, new_ids)
+        await self.plugin.delete_kv_data(f"task_{guid}")
+
+        return f"✅ 已删除任务「{item['summary']}」"
