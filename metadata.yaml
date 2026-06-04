@@ -2,7 +2,7 @@ name: astrbot_plugin_feishu_todo
 display_name: 飞书待办提醒
 desc: 自动识别飞书消息中的任务并创建飞书待办，支持多级 DDL 提醒
 short_desc: 飞书待办自动创建 + 分级 DDL 提醒
-version: v0.1.0
+version: v1.0.0
 author: xBefore
 repo: https://github.com/xBefore/astrbot_plugin_feishu_todo
 support_platforms:

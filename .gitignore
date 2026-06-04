@@ -203,3 +203,7 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# 本地开发文档，不上传 GitHub
+开发要求.md
+需求与架构.md
